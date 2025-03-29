@@ -16,7 +16,6 @@ import type { ScrobbleState } from './lastfm/lastfm';
 import fetch from 'cross-fetch';
 import { setupDarwinMenu } from './macos/menu';
 
-const { autoUpdater } = require('electron-updater');
 const localShortcuts = require('electron-localshortcut');
 const prompt = require('electron-prompt');
 const clientId = '1090770350251458592';
@@ -42,28 +41,7 @@ let mainWindow: BrowserWindow | null;
 let blocker: ElectronBlocker;
 let currentScrobbleState: ScrobbleState | null = null;
 
-let displayWhenIdling = false; // Whether to display a status message when music is paused
-let displaySCSmallIcon = false; // Whether to display the small SoundCloud logo
-
-function setupUpdater() {
-    autoUpdater.autoDownload = true;
-    autoUpdater.autoInstallOnAppQuit = true;
-
-    autoUpdater.on('update-available', () => {
-        injectToastNotification('Update Available');
-    });
-
-    autoUpdater.on('update-downloaded', () => {
-        injectToastNotification('Update Completed');
-    });
-
-    autoUpdater.checkForUpdates();
-}
-
 async function init() {
-    setupUpdater();
-
-
     if (process.platform === "darwin")
         setupDarwinMenu();
     else
@@ -83,7 +61,6 @@ async function init() {
 
     if (maximazed || !bounds) mainWindow.maximize();
 
-    // Setup proxy
     if (store.get('proxyEnabled')) {
         const { protocol, host } = store.get('proxyData');
 
@@ -92,7 +69,6 @@ async function init() {
         });
     }
 
-    // Load the SoundCloud website
     mainWindow.loadURL('https://soundcloud.com/discover');
 
     const executeJS = (script: string) => mainWindow.webContents.executeJavaScript(script);
@@ -102,7 +78,6 @@ async function init() {
         }
     });
 
-    // Wait for the page to fully load
     mainWindow.webContents.on('did-finish-load', async () => {
         const apikey = store.get('lastFmApiKey');
         const secret = store.get('lastFmSecret');
@@ -151,9 +126,9 @@ async function init() {
                     const currentTrack = {
                         author: trackInfo.author as string,
                         title: trackInfo.title
-                            .replace(/.*?:\s*/, '') // Remove everything up to and including the first colon.
-                            .replace(/\n.*/, '') // Remove everything after the first newline.
-                            .trim() as string, // Clean up any leading/trailing spaces.
+                            .replace(/.*?:\s*/, '')
+                            .replace(/\n.*/, '')
+                            .trim() as string,
                     };
 
                     const artworkUrl = await executeJS(`
@@ -170,24 +145,33 @@ async function init() {
                         executeJS(
                             `document.querySelector('.playbackTimeline__duration span:last-child')?.innerText ?? ''`,
                         ),
-                    ])//;
+                    ]);
 
                     await updateNowPlaying(currentTrack, store);
 
                     const parseTime = (time: string): number => {
                         const parts = time.split(':').map(Number);
-                        return parts.reduce((acc, part) => 60 * acc + part, 0) * 1000;
+                        return parts.reduce((acc, part) => 60 * acc + part, 0);
                     };
 
-                    const elapsedMilliseconds = parseTime(elapsedTime);
-                    const totalMilliseconds = parseTime(totalTime);
+                    const elapsedSeconds = parseTime(elapsedTime);
+                    const totalSeconds = parseTime(totalTime);
+
+                    if (currentScrobbleState) {
+                        const previousElapsed = (Date.now() - currentScrobbleState.startTime) / 1000;
+                        if (elapsedSeconds < previousElapsed - 10) {
+                            console.log(`[Last.fm] Track loop detected - resetting scrobble state
+                                Previous elapsed: ${Math.floor(previousElapsed)}s
+                                Current elapsed: ${elapsedSeconds}s`);
+                            currentScrobbleState = null;
+                        }
+                    }
 
                     if (
                         !currentScrobbleState ||
                         currentScrobbleState.artist !== currentTrack.author ||
                         currentScrobbleState.title !== currentTrack.title
                     ) {
-                        // Scrobble previous track if it wasn't scrobbled and met criteria
                         if (
                             currentScrobbleState &&
                             !currentScrobbleState.scrobbled &&
@@ -202,28 +186,20 @@ async function init() {
                             );
                         }
 
-                        // Start tracking new track
                         currentScrobbleState = {
                             artist: currentTrack.author,
                             title: currentTrack.title,
                             startTime: Date.now(),
-                            duration: timeStringToSeconds(trackInfo.duration),
+                            duration: totalSeconds,
                             scrobbled: false,
                         };
-                    } else if (
-                        currentScrobbleState &&
-                        !currentScrobbleState.scrobbled &&
-                        shouldScrobble(currentScrobbleState)
-                    ) {
-                        // Scrobble current track if it meets criteria
-                        await scrobbleTrack(
-                            {
-                                author: currentScrobbleState.artist,
-                                title: currentScrobbleState.title,
-                            },
-                            store,
-                        );
-                        currentScrobbleState.scrobbled = true;
+                        console.log(`[Last.fm] New track detected: ${currentTrack.author} - ${currentTrack.title}`);
+                    } else {
+                        if (!currentScrobbleState.scrobbled && shouldScrobble(currentScrobbleState)) {
+                            await scrobbleTrack(currentTrack, store);
+                            currentScrobbleState.scrobbled = true;
+                            console.log(`[Last.fm] Track scrobbled: ${currentTrack.author} - ${currentTrack.title}`);
+                        }
                     }
 
                     if (!info.rpc.isConnected) {
@@ -237,32 +213,25 @@ async function init() {
                         details: `${shortenString(currentTrack.title)}${(currentTrack.title.length < 2 ? '⠀⠀' : '')}`,
                         state: `${shortenString(trackInfo.author)}${(trackInfo.author.length < 2 ? '⠀⠀' : '')}`,
                         largeImageKey: artworkUrl.replace('50x50.', '500x500.'),
-                        startTimestamp: Date.now() - elapsedMilliseconds,
-                        endTimestamp: Date.now() + (totalMilliseconds - elapsedMilliseconds),
-                        smallImageKey: displaySCSmallIcon ? 'soundcloud-logo' : '',
-                        smallImageText: displaySCSmallIcon ? 'SoundCloud' : '',
-                        instance: false,
-                    });
-                } else if (displayWhenIdling) {
-                    info.rpc.user?.setActivity({
-                        details: 'Listening to SoundCloud',
-                        state: 'Paused',
-                        largeImageKey: 'idling',
-                        largeImageText: 'Paused',
-                        smallImageKey: 'soundcloud-logo',
-                        smallImageText: 'SoundCloud',
+                        startTimestamp: Date.now() - elapsedSeconds * 1000,
+                        endTimestamp: Date.now() + (totalSeconds - elapsedSeconds) * 1000,
                         instance: false,
                     });
                 } else {
-                    info.rpc.user?.clearActivity();
+                    info.rpc.user?.setActivity({
+                        type: ActivityType.Listening,
+                        details: 'SoundCloud',
+                        state: 'Paused',
+                        largeImageKey: 'soundcloud-logo',
+                        instance: false,
+                    });
                 }
             } catch (error) {
                 console.error('Error during RPC update:', error);
             }
-        }, 10000);
+        }, 5000);
     });
 
-    // Emitted when the window is closed.
     mainWindow.on('close', function () {
         store.set('bounds', mainWindow.getBounds());
         store.set('maximazed', mainWindow.isMaximized());
@@ -272,20 +241,12 @@ async function init() {
         mainWindow = null;
     });
 
-    // Register F1 shortcut for toggling dark mode
     localShortcuts.register(mainWindow, 'F1', () => toggleDarkMode());
-
-    // Register F2 shortcut for toggling the adblocker
     localShortcuts.register(mainWindow, 'F2', () => toggleAdBlocker());
-
     localShortcuts.register(mainWindow, 'F12', () => {
         mainWindow.webContents.openDevTools({ mode: 'detach' });
     });
-
-    // Register F3 shortcut to show the proxy window
     localShortcuts.register(mainWindow, 'F3', async () => toggleProxy());
-
-    // Register F4 shortcut to connecting to last.fm api
     localShortcuts.register(mainWindow, 'F4', async () => {
         const apikey = store.get('lastFmApiKey');
         const secret = store.get('lastFmSecret');
@@ -299,21 +260,18 @@ async function init() {
 
     let zoomLevel = mainWindow.webContents.getZoomLevel();
 
-    // Zoom In (Ctrl + +)
     localShortcuts.register(mainWindow, 'CmdOrCtrl+=', () => {
-        zoomLevel = Math.min(zoomLevel + 1, 9); // Limit zoom level to 9
+        zoomLevel = Math.min(zoomLevel + 1, 9);
         mainWindow.webContents.setZoomLevel(zoomLevel);
     });
 
-    // Zoom Out (Ctrl + -)
     localShortcuts.register(mainWindow, 'CmdOrCtrl+-', () => {
-        zoomLevel = Math.max(zoomLevel - 1, -9); // Limit zoom level to -9
+        zoomLevel = Math.max(zoomLevel - 1, -9);
         mainWindow.webContents.setZoomLevel(zoomLevel);
     });
 
-    // Reset Zoom (Ctrl + 0)
     localShortcuts.register(mainWindow, 'CmdOrCtrl+0', () => {
-        zoomLevel = 0; // Reset zoom level to default
+        zoomLevel = 0;
         mainWindow.webContents.setZoomLevel(zoomLevel);
     });
 
@@ -321,24 +279,20 @@ async function init() {
     localShortcuts.register(mainWindow, ['CmdOrCtrl+F', 'CmdOrCtrl+N'], () => mainWindow.webContents.goForward());
 }
 
-// When Electron has finished initializing, create the main window
 app.on('ready', init);
 
-// Quit the app when all windows are closed, unless running on macOS (where it's typical to leave apps running)
 app.on('window-all-closed', function () {
     if (process.platform !== 'darwin') {
         app.quit();
     }
 });
 
-// When the app is activated, create the main window if it doesn't already exist
 app.on('activate', function () {
     if (mainWindow === null) {
         init();
     }
 });
 
-//Function to toggle the adblocker
 function toggleAdBlocker() {
     const adBlockEnabled = store.get('adBlocker');
     store.set('adBlocker', !adBlockEnabled);
@@ -353,7 +307,6 @@ function toggleAdBlocker() {
     }
 }
 
-// Handle proxy authorization
 app.on('login', async (_event, _webContents, _request, authInfo, callback) => {
     if (authInfo.isProxy) {
         if (!store.get('proxyEnabled')) {
@@ -366,7 +319,6 @@ app.on('login', async (_event, _webContents, _request, authInfo, callback) => {
     }
 });
 
-// Function to toggle proxy
 async function toggleProxy() {
     const proxyUri = await prompt({
         title: 'Setup Proxy',
@@ -405,7 +357,6 @@ async function toggleProxy() {
     }
 }
 
-//Function to toggle dark mode
 function toggleDarkMode() {
     const darkModeEnabled = store.get('darkMode');
     store.set('darkMode', !darkModeEnabled);
@@ -420,7 +371,6 @@ function shortenString(str: string): string {
     return str.length > 128 ? str.substring(0, 128) + '...' : str;
 }
 
-// Function to inject toast notification into the main page
 export function injectToastNotification(message: string) {
     if (mainWindow) {
         mainWindow.webContents.executeJavaScript(`
@@ -446,7 +396,7 @@ export function injectToastNotification(message: string) {
         setTimeout(() => {
           notificationElement.remove();
         }, 500); 
-      }, 4500); // Duration of showing the notification
+      }, 4500);
     `);
     }
 }

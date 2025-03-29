@@ -1,4 +1,4 @@
-import type { BrowserWindow } from 'electron';
+import { BrowserWindow } from 'electron';
 
 import * as crypto from 'crypto';
 import fetch from 'cross-fetch';
@@ -24,9 +24,16 @@ function timeStringToSeconds(timeStr: string | undefined): number {
 }
 function shouldScrobble(state: ScrobbleState): boolean {
     const playedTime = (Date.now() - state.startTime) / 1000;
-    const halfDuration = state.duration / 2;
+    const minimumTime = 30;
 
-    return !state.scrobbled && playedTime >= Math.min(halfDuration, 240);
+    console.log(`[Last.fm] Scrobble Check:
+    - Track: ${state.artist} - ${state.title}
+    - Played time: ${Math.floor(playedTime)}s
+    - Required time: ${Math.floor(minimumTime)}s
+    - Already scrobbled: ${state.scrobbled}
+    `);
+
+    return !state.scrobbled && playedTime >= minimumTime;
 }
 
 async function authenticateLastFm(mainWindow: BrowserWindow, store: ElectronStore): Promise<void> {
@@ -41,22 +48,81 @@ async function authenticateLastFm(mainWindow: BrowserWindow, store: ElectronStor
         return;
     }
 
-    const authUrl = `https://www.last.fm/api/auth/?api_key=${apiKey}&cb=https://soundcloud.com/discover`;
-
-    await mainWindow.loadURL(authUrl);
-
-    mainWindow.webContents.on('will-redirect', async (_, url) => {
-        try {
-            const urlObj = new URL(url);
-            const token = urlObj.searchParams.get('token');
-            if (token) {
-                await getLastFmSession(apiKey, token, store);
-                mainWindow.loadURL('https://soundcloud.com/discover');
-            }
-        } catch (error) {
-            console.error('Error during Last.fm authentication', error);
+    // Create a new window for Last.fm authentication
+    const authWindow = new BrowserWindow({
+        width: 800,
+        height: 600,
+        title: 'Last.fm Authentication',
+        webPreferences: {
+            nodeIntegration: false,
+            contextIsolation: true,
+            webSecurity: true,
+            allowRunningInsecureContent: false,
+            webviewTag: true,
+            sandbox: false,
+            devTools: true,
+            partition: 'persist:lastfm-auth'
         }
     });
+
+    // Set user agent to avoid potential issues with Last.fm's website
+    authWindow.webContents.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+
+    // Enable remote module for debugging if needed
+    authWindow.webContents.openDevTools();
+
+    // Use the official Last.fm auth URL with proper format
+    const authUrl = `http://www.last.fm/api/auth?api_key=${apiKey}`;
+
+    try {
+        await authWindow.loadURL(authUrl);
+
+        // Handle navigation events
+        authWindow.webContents.on('did-navigate', async (_, url) => {
+            try {
+                const urlObj = new URL(url);
+                const token = urlObj.searchParams.get('token');
+                if (token) {
+                    await getLastFmSession(apiKey, token, store);
+                    authWindow.close();
+                    mainWindow.loadURL('https://soundcloud.com/discover');
+                }
+            } catch (error) {
+                console.error('Error during Last.fm navigation:', error);
+            }
+        });
+
+        // Handle navigation to different origins
+        authWindow.webContents.on('will-navigate', (event, url) => {
+            const urlObj = new URL(url);
+            // Allow navigation to Last.fm domains
+            if (!urlObj.hostname.includes('last.fm')) {
+                event.preventDefault();
+            }
+        });
+
+        // Handle errors
+        authWindow.webContents.on('did-fail-load', (_, errorCode, errorDescription, validatedURL) => {
+            // Ignore errors for canceled requests
+            if (errorCode === -3) return;
+            
+            console.error('Failed to load:', validatedURL);
+            console.error('Error code:', errorCode);
+            console.error('Description:', errorDescription);
+        });
+
+        // Handle window close
+        authWindow.on('closed', () => {
+            // Clean up event listeners
+            authWindow.webContents.removeAllListeners('did-navigate');
+            authWindow.webContents.removeAllListeners('will-navigate');
+            authWindow.webContents.removeAllListeners('did-fail-load');
+        });
+
+    } catch (error) {
+        console.error('Error during Last.fm authentication setup:', error);
+        authWindow.close();
+    }
 }
 
 // After the user logs in, retrieve and store the session key
@@ -100,15 +166,17 @@ function generateApiSignature(
 }
 
 async function scrobbleTrack(trackInfo: { author: string; title: string }, store: ElectronStore): Promise<void> {
+    console.log(`[Last.fm] Attempting to scrobble: ${trackInfo.author} - ${trackInfo.title}`);
+    
     const sessionKey = store.get('lastFmSessionKey');
     if (!sessionKey) {
-        console.error('No Last.fm session key found');
+        console.error('[Last.fm] No session key found - not authenticated');
         return;
     }
     const apiKey = store.get('lastFmApiKey') as string;
     const secretKey = store.get('lastFmSecret') as string;
     if (!apiKey || !secretKey) {
-        console.error('No Last.fm API key found');
+        console.error('[Last.fm] Missing API key or secret');
         return;
     }
 
@@ -123,6 +191,7 @@ async function scrobbleTrack(trackInfo: { author: string; title: string }, store
     };
     const apiSig = generateApiSignature(params, secretKey);
     try {
+        console.log('[Last.fm] Sending scrobble request...');
         const response = await fetch(`https://ws.audioscrobbler.com/2.0/`, {
             method: 'POST',
             headers: {
@@ -137,12 +206,12 @@ async function scrobbleTrack(trackInfo: { author: string; title: string }, store
 
         const data = await response.json();
         if (data.error) {
-            console.error('Last.fm scrobble error', data.message);
+            console.error('[Last.fm] Scrobble failed:', data.message);
         } else {
-            console.log(`Track scrobbled on Last.fm ${trackInfo.author} - ${trackInfo.title}`);
+            console.log(`[Last.fm] ✓ Successfully scrobbled: ${trackInfo.author} - ${trackInfo.title}`);
         }
     } catch (error) {
-        console.error('Failed to scrobble track:', error);
+        console.error('[Last.fm] Failed to scrobble track:', error);
     }
 }
 
@@ -152,14 +221,17 @@ const trackChanged = (current: any, previous: any): boolean => {
 };
 
 async function updateNowPlaying(trackInfo: { author: any; title: any }, store: ElectronStore): Promise<void> {
+    console.log(`[Last.fm] Updating now playing: ${trackInfo.author} - ${trackInfo.title}`);
+    
     const sessionKey = store.get('lastFmSessionKey');
     if (!sessionKey) {
+        console.log('[Last.fm] No session key found - skipping now playing update');
         return;
     }
     const apiKey = store.get('lastFmApiKey') as string;
     const secretKey = store.get('lastFmSecret') as string;
     if (!apiKey || !secretKey) {
-        console.error('No Last.fm API key found');
+        console.error('[Last.fm] Missing API key or secret');
         return;
     }
 
@@ -187,11 +259,12 @@ async function updateNowPlaying(trackInfo: { author: any; title: any }, store: E
 
         const data = await response.json();
         if (data.error) {
-            console.error('Last.fm now playing error', data.message);
-            return;
+            console.error('[Last.fm] Now playing update failed:', data.message);
+        } else {
+            console.log(`[Last.fm] ✓ Now playing updated: ${trackInfo.author} - ${trackInfo.title}`);
         }
     } catch (e) {
-        console.error('Failed to update now playing', e);
+        console.error('[Last.fm] Failed to update now playing:', e);
     }
 }
 
